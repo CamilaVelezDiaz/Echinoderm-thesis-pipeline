@@ -1026,29 +1026,91 @@ cat(sprintf("Year range: %d - %d\n",
 
 # =============================================================================
 # ADDITION: RESOLVE best_eventDate (source-priority consensus column)
+#           + year-validity filter + best_year back-fill from eventDate
 # =============================================================================
+# REPLACES the previous best_eventDate block (from the "resolving
+# best_eventDate" cat() to the end of Section 3).
+#
 # eventDate strings vary in format across sources (e.g. "2009-11-11 12:00:00"
 # vs bare years vs date ranges), so majority-vote-on-exact-string (as used
 # for best_year, above) would rarely agree even where sources mean the same
 # date. Instead this takes the highest-priority source's eventDate per
 # record, using the single shared SOURCE_PRIORITY defined at the top of the
-# script - the same list primary_source assignment was already based on
-# (Appendix C), so this is really just "read the field the record's
-# priority source actually populated" rather than a separate resolution
-# rule of its own.
+# script.
 #
-# best_year remains authoritative for year-level analysis; best_eventDate is
-# supplementary full-date precision where available, and will likely need
-# format cleanup before being published as its own column - check the
-# printed sample of distinct values below for mixed formats.
+# Year-validity rule (same rule already applied to the year__* fields above):
+#   An eventDate is only usable if its year(s) fall within
+#   MIN_VALID_YEAR - MAX_VALID_YEAR. This removes
+#     - the 4 impossible iDigBio/QM dates (0154-05-20, 0954-01-03,
+#       0983-05-04, 1472-10-09) - data-entry artefacts, see Fix 1 above;
+#     - the 40 MCZ batch-digitisation placeholders. In the source these are
+#       RANGES whose start is a placeholder (e.g. "1850-01-01/1907-04-03",
+#       "1800-01-01/1950-12-31"); the YYYY-MM-DD truncation below would
+#       otherwise have kept only the placeholder start ("1850-01-01").
+#       They remain identifiable via is_historical_collection = TRUE.
+#   The filter is applied PER SOURCE CELL, before the priority pick, so an
+#   invalid date in a high-priority source cannot hide a valid date held by
+#   a lower-priority source for the same record.
+#
+# best_year back-fill:
+#   Some records have no value in any year__* field but DO have a valid
+#   eventDate. best_year is filled from best_eventDate for those records,
+#   provided the eventDate resolves to a single year (a multi-year range such
+#   as "1980/1985" has no single collection year and stays NA).
+#   best_year_source records where each best_year came from.
 # =============================================================================
 
 cat("\n── Section 3 addition: resolving best_eventDate ──\n\n")
+
+MIN_VALID_YEAR <- 1861
+MAX_VALID_YEAR <- as.integer(format(Sys.Date(), "%Y"))
 
 ed_cols <- names(echino_wide)[str_detect(names(echino_wide), "^eventDate__")]
 
 ordered_ed_cols <- intersect(paste0("eventDate__", SOURCE_PRIORITY), ed_cols)
 ordered_ed_cols <- c(ordered_ed_cols, setdiff(ed_cols, ordered_ed_cols))
+
+# Start / end year of an eventDate string. Handles "YYYY", "YYYY-MM",
+# "YYYY-MM-DD hh:mm:ss", and ISO ranges "start/end" where end is itself a
+# full date or bare year ("1980/1985", "1850-01-01/1907-04-03"). An end
+# part without a 4-digit year (e.g. "1962-10-13/14") is in the start year.
+ed_start_year <- function(x) {
+  suppressWarnings(as.integer(str_match(x, "^\\s*(\\d{4})")[, 2]))
+}
+ed_end_year <- function(x) {
+  end <- suppressWarnings(as.integer(str_match(x, "/\\s*(\\d{4})")[, 2]))
+  coalesce(end, ed_start_year(x))
+}
+# Values with no leading 4-digit year (e.g. the ~150 iDigBio "D/M/YYYY"
+# strings, which never win the priority pick) are not judged here and are
+# left untouched, so only genuinely out-of-range years are removed.
+ed_year_valid <- function(x) {
+  sy <- ed_start_year(x)
+  ey <- ed_end_year(x)
+  is.na(sy) |
+    (sy >= MIN_VALID_YEAR & sy <= MAX_VALID_YEAR &
+       ey >= MIN_VALID_YEAR & ey <= MAX_VALID_YEAR)
+}
+
+# --- Diagnostic: per-source eventDate values removed by the validity rule ---
+ed_invalid_log <- echino_wide %>%
+  select(record_key, all_of(ordered_ed_cols)) %>%
+  mutate(across(all_of(ordered_ed_cols), as.character)) %>%
+  pivot_longer(-record_key, names_to = "ed_source", values_to = "eventDate_raw") %>%
+  filter(!is.na(eventDate_raw), str_trim(eventDate_raw) != "") %>%
+  filter(!ed_year_valid(eventDate_raw))
+
+cat("Per-source eventDate values outside", MIN_VALID_YEAR, "-", MAX_VALID_YEAR,
+    "set to NA:", nrow(ed_invalid_log), "\n")
+ed_invalid_log %>% count(ed_source, sort = TRUE) %>% print()
+write_csv(ed_invalid_log, "eventDate_invalid_removed.csv")
+
+# --- Priority pick over VALID values only ---
+ed_mat <- echino_wide %>%
+  select(all_of(ordered_ed_cols)) %>%
+  mutate(across(everything(), as.character)) %>%
+  mutate(across(everything(), ~ if_else(ed_year_valid(.x), .x, NA_character_))) %>%
+  as.matrix()
 
 first_non_missing <- function(row_vals) {
   # row_vals arrives already in source-priority order (see ordered_ed_cols)
@@ -1056,8 +1118,6 @@ first_non_missing <- function(row_vals) {
   if (length(vals) == 0) return(NA_character_)
   vals[1]
 }
-
-ed_mat <- echino_wide %>% select(all_of(ordered_ed_cols)) %>% as.matrix()
 
 echino_wide <- echino_wide %>%
   mutate(best_eventDate = apply(ed_mat, 1, first_non_missing))
@@ -1074,9 +1134,72 @@ echino_wide <- echino_wide %>%
     best_eventDate
   ))
 
+# --- Back-fill best_year from best_eventDate ---
+ed_sy <- ed_start_year(echino_wide$best_eventDate)
+ed_ey <- ed_end_year(echino_wide$best_eventDate)
+ed_single_year <- if_else(!is.na(ed_sy) & ed_sy == ed_ey, as.numeric(ed_sy), NA_real_)
+
+n_year_before <- sum(!is.na(echino_wide$best_year))
+
+echino_wide <- echino_wide %>%
+  mutate(
+    best_year_source = case_when(
+      !is.na(best_year)      ~ "year_field",
+      !is.na(ed_single_year) ~ "eventDate",
+      TRUE                   ~ NA_character_
+    ),
+    best_year = coalesce(best_year, ed_single_year)
+  )
+
+cat(sprintf("\nbest_year back-filled from eventDate: %d records\n",
+            sum(!is.na(echino_wide$best_year)) - n_year_before))
+cat("best_year_source breakdown:\n")
+echino_wide %>% count(best_year_source) %>% print()
+
+multi_year_ranges <- echino_wide %>%
+  filter(is.na(best_year), !is.na(best_eventDate))
+if (nrow(multi_year_ranges) > 0) {
+  cat("\nRecords with a multi-year eventDate range and no year field",
+      "(best_year and best_eventDate both set to NA):\n")
+  multi_year_ranges %>% select(record_key, best_eventDate) %>% print(n = Inf)
+}
+
+# A multi-year range with no supporting year field (e.g. CAT_J.32259,
+# "1980/1985") cannot be resolved to a collection date, so it is treated as
+# undated in best_eventDate too. Ranges on records that DO have a year field
+# (e.g. "1976/1977" with best_year 1976) are kept.
+echino_wide <- echino_wide %>%
+  mutate(best_eventDate = if_else(record_key %in% multi_year_ranges$record_key,
+                                  NA_character_, best_eventDate))
+
+# --- Consistency checks ---
+yr_mismatch <- echino_wide %>%
+  filter(!is.na(best_year), !is.na(best_eventDate),
+         best_year < ed_start_year(best_eventDate) |
+           best_year > ed_end_year(best_eventDate))
+cat("\nRecords where best_year falls outside best_eventDate's year(s):",
+    nrow(yr_mismatch), "\n")
+if (nrow(yr_mismatch) > 0) {
+  write_csv(yr_mismatch %>% select(record_key, best_year, best_eventDate,
+                                   all_of(year_cols), all_of(ordered_ed_cols)),
+            "year_eventDate_mismatch.csv")
+}
+
+stopifnot(
+  all(is.na(echino_wide$best_year) |
+        (echino_wide$best_year >= MIN_VALID_YEAR & echino_wide$best_year <= MAX_VALID_YEAR)),
+  all(is.na(echino_wide$best_eventDate) | ed_year_valid(echino_wide$best_eventDate))
+)
+
 n_with_ed <- sum(!is.na(echino_wide$best_eventDate))
-cat(sprintf("Records with best_eventDate resolved: %d of %d (%.1f%%)\n",
+cat(sprintf("\nRecords with best_eventDate resolved: %d of %d (%.1f%%)\n",
             n_with_ed, nrow(echino_wide), 100 * n_with_ed / nrow(echino_wide)))
+n_with_year <- sum(!is.na(echino_wide$best_year))
+cat(sprintf("Records with best_year resolved:      %d of %d (%.1f%%)\n",
+            n_with_year, nrow(echino_wide), 100 * n_with_year / nrow(echino_wide)))
+cat(sprintf("best_year range: %d - %d\n",
+            min(echino_wide$best_year, na.rm = TRUE),
+            max(echino_wide$best_year, na.rm = TRUE)))
 cat("Sample of distinct formats present (check for cleanup before publishing):\n")
 print(head(unique(echino_wide$best_eventDate), 15))
 
@@ -4260,13 +4383,6 @@ cat("  column_documentation.csv                     - key column reference\n")
 #   dwca_public_release/eml.xml
 #   echinoderm_dwca_public_release.zip
 #
-# PLACEHOLDERS TO FILL IN BEFORE PUBLICATION (search for "<<< FILL IN >>>"):
-#   * ORCID iDs for Alastair Birtles and Sue-Ann Watson
-#   * Scientific Data DOI (in `references`, EML citation, and abstract)
-#   * Dataset DOI          (in `datasetID`, EML citation)
-#   * IPT / repository download URL (in EML <distribution>)
-#   * GRSciColl institution/collection UUIDs (institutionID, collectionID)
-#   * Grant / funding information (EML <project>)
 # =============================================================================
 
 cat("\n== Section 8: Darwin Core Archive export (public release) ==\n\n")
@@ -4378,10 +4494,9 @@ occ <- tibble(
   language            = "eng",
   license             = coalesce(echino_wide$license_resolved, ""),
   rightsHolder        = "James Cook University",
-  # <<< FILL IN: Scientific Data DOI once assigned >>>
-  references          = "https://doi.org/[Scientific-Data-DOI]", # populated after Scientific Data DOI is minted
-  # <<< FILL IN: Dataset DOI once minted (Zenodo, OBIS, or ALA) >>>
-  datasetID           = "https://doi.org/[Dataset-DOI]", # populated after Zenodo/OBIS DOI is minted
+  # <<< FILL IN: BDJ DOI once assigned >>>
+  references          = "", # populated after BDJ DOI is minted
+  datasetID           = "https://doi.org/10.5281/zenodo.23639651", # populated after Zenodo DOI is minted
   datasetName         = "Integrated echinoderm occurrence dataset for northeast Australia and the adjacent Coral Sea",
   
   # ---- institution / collection ----
@@ -4522,8 +4637,92 @@ cat("  Records kept: all", nrow(occ), "- no exclusion filters applied.\n")
 # Blank out non-ISO event dates (keep the record; drop only the date)
 occ$eventDate[!is_iso_date(occ$eventDate)] <- ""
 
-# Strip tabs / newlines / stray double-quotes from every field
-occ <- occ %>% mutate(across(everything(), safe_text))
+# -----------------------------------------------------------------------------
+# 8.4b  Encoding repair, rightsHolder, countryCode
+# -----------------------------------------------------------------------------
+
+# --- 1. Broken characters ----------------------------------------------------
+# (a) Mojibake: UTF-8 text that was read as Latin-1 at some point
+#     ("MÃ¼ller" -> "Müller"). Reversible, so it's fixed generically.
+fix_mojibake <- function(x) {
+  hit <- !is.na(x) & str_detect(x, "\u00c3[\u0080-\u00bf]")
+  if (!any(hit)) return(x)
+  y <- iconv(x[hit], from = "UTF-8", to = "latin1")  # back to the original bytes
+  Encoding(y) <- "UTF-8"                              # read them correctly
+  ok <- !is.na(y) & validUTF8(y)
+  x[hit][ok] <- y[ok]
+  x
+}
+
+# (b) U+FFFD: the letter was already lost in the source, so it can't be
+#     decoded; each case is replaced explicitly.
+fffd_fixes <- c(
+  "M\uFFFDller"  = "M\u00fcller",     # Müller
+  "Forsk\uFFFDl" = "Forssk\u00e5l"    # Forsskål (WoRMS spelling)
+)
+
+occ <- occ %>%
+  mutate(across(everything(), fix_mojibake),
+         across(everything(), ~ str_replace_all(.x, fffd_fixes)))
+
+# Stop if anything broken remains
+bad_enc <- occ %>%
+  summarise(across(everything(),
+                   ~ sum(str_detect(.x, "\uFFFD|\u00c3[\u0080-\u00bf]")))) %>%
+  pivot_longer(everything()) %>% filter(value > 0)
+if (nrow(bad_enc) > 0) {
+  print(bad_enc)
+  print(unique(unlist(lapply(occ[bad_enc$name], function(x)
+    x[str_detect(x, "\uFFFD|\u00c3[\u0080-\u00bf]")]))))
+  stop("Broken characters remain - add them to fffd_fixes.")
+}
+cat("Encoding check passed.\n")
+
+# --- 2. rightsHolder ---------------------------------------------------------
+# JCU holds rights only to the compilation, not to third-party records.
+# Priority: (a) rightsHolder reported by the source, if the pipeline kept it;
+#           (b) the holding institution for the AM/QMT direct CMS exports;
+#           (c) otherwise blank (unknown), not JCU.
+rh_source <- if (any(str_detect(names(echino_wide), "^rightsHolder__"))) {
+  coalesce_field_by_priority(echino_wide, "rightsHolder")
+} else {
+  rep(NA_character_, nrow(echino_wide))
+}
+
+rh_institutional <- case_when(
+  coalesce(echino_wide$license_source, "") == "institutional_written_permission" &
+    occ$institutionCode == "AM" ~ "Australian Museum",
+  coalesce(echino_wide$license_source, "") == "institutional_written_permission" &
+    occ$institutionCode %in% c("QM", "QMT", "MTQ") ~ "Queensland Museum",
+  TRUE ~ NA_character_
+)
+
+occ$rightsHolder <- coalesce(rh_source, rh_institutional, "")
+cat("rightsHolder values:\n"); print(head(sort(table(occ$rightsHolder), decreasing = TRUE), 15))
+
+# --- 3. countryCode ----------------------------------------------------------
+country_to_iso2 <- c(
+  "Australia"        = "AU",
+  "Papua New Guinea" = "PG",
+  "New Caledonia"    = "NC",
+  "Solomon Islands"  = "SB",
+  "Vanuatu"          = "VU"
+)
+derived_cc <- unname(country_to_iso2[str_trim(occ$country)])
+occ$countryCode <- if_else(occ$countryCode == "" & !is.na(derived_cc),
+                           derived_cc, occ$countryCode)
+
+# Flag any country not in the lookup, and any country/code mismatch
+unmapped <- unique(occ$country[occ$country != "" & occ$countryCode == ""])
+if (length(unmapped) > 0) stop("Add to country_to_iso2: ", paste(unmapped, collapse = "; "))
+mismatch <- occ %>% filter(country %in% names(country_to_iso2),
+                           countryCode != country_to_iso2[country])
+if (nrow(mismatch) > 0) { print(count(mismatch, country, countryCode)); warning("country/countryCode mismatches") }
+cat("countryCode:\n"); print(table(occ$countryCode, useNA = "ifany"))
+
+
+# Strip tabs / newlines / stray double-quotes from every field (except the JSON)
+occ <- occ %>% mutate(across(-dynamicProperties, safe_text))
 
 # Final assertions
 stopifnot(all(!is.na(occ$occurrenceID) & occ$occurrenceID != ""))
@@ -4734,23 +4933,20 @@ eml_xml <- c(
   '      <electronicMailAddress>mariacamila.velezdiaz@my.jcu.edu.au</electronicMailAddress>',
   '      <userId directory="https://orcid.org/">0000-0003-4180-1077</userId>',
   '    </creator>',
+  '    <creator>',
+  '      <individualName><givenName>Alastair</givenName><surName>Birtles</surName></individualName>',
+  '      <organizationName>James Cook University</organizationName>',
+  '    </creator>',
+  '    <creator>',
+  '      <individualName><givenName>Sue-Ann</givenName><surName>Watson</surName></individualName>',
+  '      <organizationName>James Cook University</organizationName>',
+  '      <userId directory="https://orcid.org/">0000-0002-9818-7429</userId>',
+  '    </creator>',
   '    <metadataProvider>',
   '      <individualName><givenName>Maria Camila</givenName><surName>Velez Diaz</surName></individualName>',
   '      <organizationName>James Cook University</organizationName>',
   '      <electronicMailAddress>mariacamila.velezdiaz@my.jcu.edu.au</electronicMailAddress>',
   '    </metadataProvider>',
-  '    <associatedParty>',
-  '      <individualName><givenName>Alastair</givenName><surName>Birtles</surName></individualName>',
-  '      <organizationName>James Cook University</organizationName>',
-  #  <<< OPTIONAL: add <userId directory="https://orcid.org/">ORCID</userId> >>>
-  '      <role>coPrincipalInvestigator</role>',
-  '    </associatedParty>',
-  '    <associatedParty>',
-  '      <individualName><givenName>Sue-Ann</givenName><surName>Watson</surName></individualName>',
-  '      <organizationName>James Cook University</organizationName>',
-  #  <<< OPTIONAL: add <userId directory="https://orcid.org/">ORCID</userId> >>>
-  '      <role>coPrincipalInvestigator</role>',
-  '    </associatedParty>',
   '    <associatedParty>',
   '      <organizationName>Australian Museum</organizationName>',
   '      <role>contentProvider</role>',
@@ -4762,7 +4958,7 @@ eml_xml <- c(
   paste0('    <pubDate>', format(Sys.Date(), "%Y-%m-%d"), '</pubDate>'),
   '    <language>eng</language>',
   '    <abstract>',
-  '      <para>An integrated occurrence dataset of echinoderms (Phylum Echinodermata) for northeast Australia and the adjacent Coral Sea, spanning shelf, slope and abyssal habitats between 10 degrees S to 29 degrees S and 142 degrees E to 154 degrees E. The dataset consolidates 43,470 curated occurrence records assembled from 13 source datasets covering national and international biodiversity aggregators, a national research infrastructure, and direct Collection Management System exports from the Queensland Museum Tropics and the Australian Museum. Records were integrated through a reproducible R workflow that harmonises Darwin Core fields, deduplicates records across sources, and resolves conflicts in coordinates, collection year, basis of record, depth and taxonomic name against the World Register of Marine Species (WoRMS). Per-record data-quality flags (coordinate quality, depth quality, taxonomic resolution) are provided as MeasurementOrFact rows and in dynamicProperties. Full methods are described in the accompanying Data paper.</para>',
+  '      <para>An integrated occurrence dataset of echinoderms (Phylum Echinodermata) for northeast Australia and the adjacent Coral Sea, spanning shelf, slope and abyssal habitats between 9 degrees S to 30 degrees S and 136 degrees E to 167 degrees E. The dataset consolidates 43,470 curated occurrence records assembled from 13 source datasets covering national and international biodiversity aggregators, a national research infrastructure, and direct Collection Management System exports from the Queensland Museum Tropics and the Australian Museum. Records were integrated through a reproducible R workflow that harmonises Darwin Core fields, deduplicates records across sources, and resolves conflicts in coordinates, collection year, basis of record, depth and taxonomic name against the World Register of Marine Species (WoRMS). Per-record data-quality flags (coordinate quality, depth quality, taxonomic resolution) are provided as MeasurementOrFact rows and in dynamicProperties. Full methods are described in the accompanying Data paper.</para>',
   '    </abstract>',
   '    <keywordSet>',
   '      <keyword>Occurrence</keyword>',
@@ -4782,12 +4978,11 @@ eml_xml <- c(
   '      <keyword>deep sea</keyword>',
   '    </keywordSet>',
   '    <intellectualRights>',
-  '    <para>The original compilation, curation, quality-control information, consensus fields, derived variables, and associated documentation produced by the authors are released under a Creative Commons Attribution 4.0 International licence (CC BY 4.0). Third-party source records and associated content retain their original licences and rights conditions, as specified by the respective data providers and, where applicable, in the licence and provenance information retained per-record in this dataset (see the "license" field of occurrence.txt). Original Collection Management System exports supplied by the Australian Museum and Queensland Museum Tropics were used with written permission and remain subject to the holding institutions\' access conditions; derived occurrence records from these sources are included in the deposited dataset with the depositors\' permission.</para>',
+  '    <para>The original compilation, curation, quality-control information, consensus fields, derived variables, and associated documentation produced by the authors are released under a Creative Commons Attribution 4.0 International licence (CC BY 4.0). Third-party source records and associated content retain their original licences and rights conditions, as specified by the respective data providers and, where applicable, in the licence and provenance information retained per record in the deposited dataset. Records for which no source licence could be determined remain unspecified rather than being assumed to be openly licensed. Original Collection Management System exports supplied by the Australian Museum and Queensland Museum Tropics were used with written permission and remain subject to the holding institutions\' access conditions; derived occurrence records from these sources are included in the deposited dataset with the institutions\' permission.</para>',
   '    </intellectualRights>',
   '    <distribution scope="document">',
   '      <online>',
-  # <<< FILL IN: IPT / Zenodo DwC-A URL once published >>>
-  '        <url function="download">[Insert IPT or Zenodo DwC-A URL after publication]</url>',
+  '        <url function="download">https://doi.org/10.5281/zenodo.23639651</url>', # Zenodo DwC-A URL once published
   '      </online>',
   '    </distribution>',
   '    <coverage>',
@@ -4801,8 +4996,8 @@ eml_xml <- c(
   '      </geographicCoverage>',
   '      <temporalCoverage>',
   '        <rangeOfDates>',
-  '          <beginDate><calendarDate>1861-01-01</calendarDate></beginDate>',
-  '          <endDate><calendarDate>2026-07-30</calendarDate></endDate>',
+  '          <beginDate><calendarDate>1861-06-07</calendarDate></beginDate>',
+  '          <endDate><calendarDate>2026-03-28</calendarDate></endDate>',
   '        </rangeOfDates>',
   '      </temporalCoverage>',
   '      <taxonomicCoverage>',
@@ -4827,7 +5022,7 @@ eml_xml <- c(
   '    <methods>',
   '      <methodStep>',
   '        <description>',
-  '          <para>Occurrence records were integrated from 13 source datasets, harmonised to Darwin Core, deduplicated using a hierarchical occurrenceID / catalogNumber / composite-key strategy, and cross-source conflicts in coordinates, collection year, depth, basis of record and taxonomic name were resolved through a scripted R workflow. All scientific names were validated against the World Register of Marine Species (WoRMS). Per-record data-quality flags are provided in the MeasurementOrFact extension and in dynamicProperties. Full methods are described in the associated Data paper.</para>',
+  '          <para>Occurrence records were integrated from 13 source datasets, harmonised to Darwin Core, deduplicated using a hierarchical occurrenceID / catalogNumber / composite-key strategy, and cross-source conflicts in coordinates, collection year, depth, basis of record and taxonomic name were resolved through a scripted R workflow. All scientific names were validated against the World Register of Marine Species (WoRMS). Per-record data-quality flags are provided in the MeasurementOrFact extension and in dynamicProperties. Full methods are described in the associated Data paper. We thank M. Mitchell (James Cook University) and S. Borghi (Collection Manager Cnidaria, Collections Research and Exhibitions, Queensland Museum Tropics) for providing the CIDARIS direct CMS exports, and C. Rowe (Collection Manager Marine Invertebrates, Australian Museum) for providing the AM Echinodermata direct CMS export. We thank the Atlas of Living Australia, GBIF, OBIS, OZCAM, iDigBio and CSIRO NCMI for making their data holdings openly available. We acknowledge the WoRMS Editorial Board for maintaining the reference taxonomy used to validate the dataset.</para>',
   '        </description>',
   '      </methodStep>',
   '    </methods>',
@@ -4837,16 +5032,14 @@ eml_xml <- c(
   '        <individualName><givenName>Maria Camila</givenName><surName>Velez Diaz</surName></individualName>',
   '        <role>principalInvestigator</role>',
   '      </personnel>',
-  # <<< OPTIONAL: add <funding> block if grant information applies >>>
-  '    </project>',
+  '      <funding><para>Australian Research Council Future Fellowship FT240100685 (S.-A. Watson); James Cook University.</para></funding>',  '    </project>',
   '  </dataset>',
   '  <additionalMetadata>',
   '    <metadata>',
   '      <gbif>',
   paste0('        <dateStamp>', format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"), '</dateStamp>'),
   '        <hierarchyLevel>dataset</hierarchyLevel>',
-  # <<< FILL IN: dataset DOI once minted >>>
-  '        <citation>Velez Diaz, M.C., Birtles, A. and Watson, S.-A. (2026). Integrated echinoderm occurrence dataset for northeast Australia and the adjacent Coral Sea. James Cook University. https://doi.org/[Dataset-DOI]</citation>',
+  '        <citation>Velez Diaz, M.C., Birtles, A. and Watson, S.-A. (2026). Integrated echinoderm occurrence dataset for northeast Australia and the adjacent Coral Sea. James Cook University. https://doi.org/10.5281/zenodo.23639651</citation>',
   '        <resourceLogoUrl></resourceLogoUrl>',
   '      </gbif>',
   '    </metadata>',
@@ -4879,13 +5072,8 @@ cat("  ", zip_target, "\n\n")
 
 cat("Next steps before public deposit:\n")
 cat("  1. Fill in the five placeholders marked '<<< FILL IN >>>' in this script:\n")
-cat("       - Scientific Data DOI (references)\n")
+cat("       - BDJ DOI (references)\n")
 cat("       - Dataset DOI (datasetID, EML citation)\n")
-cat("       - IPT / Zenodo download URL (EML <distribution>)\n")
-cat("       - Alastair Birtles / Sue-Ann Watson ORCID iDs (EML <associatedParty>)\n")
-cat("       - Grant / funding information (EML <project>)\n")
-cat("  2. Validate the archive at https://tools.gbif.org/dwca-validator/\n")
-cat("  3. Deposit on Zenodo for an immediate citable DOI.\n")
 cat("  4. Submit through the OBIS Australia IPT (or ALA IPT);\n")
 cat("     federation to GBIF is automatic once accepted.\n")
 
