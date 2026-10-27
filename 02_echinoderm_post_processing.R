@@ -4742,7 +4742,7 @@ print(table(occ$taxonRank))
 # 8.5  Write occurrence.txt
 # -----------------------------------------------------------------------------
 write_delim(occ, file.path(dwc_dir, "occurrence.txt"),
-            delim = "\t", na = "", quote = "none", eol = "\n")
+            delim = "\t", na = "", quote = "none", escape = "none", eol = "\n")
 cat("Wrote", file.path(dwc_dir, "occurrence.txt"),
     ":", nrow(occ), "records x", ncol(occ), "fields\n")
 
